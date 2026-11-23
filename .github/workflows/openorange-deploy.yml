@@ -1,0 +1,108 @@
+﻿name: OpenOrange deploy (Rivet)
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Worker to deploy (router|workshop-backend|jo-os-context|jo-os-custom-gatekeeper|jo-os-scheduler|jo-os-websearch|all)"
+        required: true
+        default: "all"
+      cluster:
+        description: "Rivet cluster"
+        required: true
+        default: "curl-trench"
+      dry_run:
+        description: "Run orange doctor/build dry-run checks only"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      RIVET_CLOUD_TOKEN: ${{ secrets.RIVET_CLOUD_TOKEN }}
+      ORANGE_CLUSTER: ${{ inputs.cluster }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Install OpenOrange CLI
+        run: npm install -g open-orange@latest
+
+      - name: Verify Docker
+        run: docker --version
+
+      - name: Select workers
+        id: workers
+        shell: bash
+        run: |
+          case "${{ inputs.worker }}" in
+            router) echo "list=jo-os-router" >> $GITHUB_OUTPUT ;;
+            workshop-backend) echo "list=workshop-backend" >> $GITHUB_OUTPUT ;;
+            jo-os-context) echo "list=jo-os-context" >> $GITHUB_OUTPUT ;;
+            jo-os-custom-gatekeeper) echo "list=jo-os-custom-gatekeeper" >> $GITHUB_OUTPUT ;;
+            jo-os-scheduler) echo "list=jo-os-scheduler" >> $GITHUB_OUTPUT ;;
+            jo-os-websearch) echo "list=jo-os-websearch" >> $GITHUB_OUTPUT ;;
+            all) echo "list=workshop-backend jo-os-context jo-os-custom-gatekeeper jo-os-scheduler jo-os-websearch jo-os-router" >> $GITHUB_OUTPUT ;;
+            *) echo "Unknown worker: ${{ inputs.worker }}" >&2; exit 1 ;;
+          esac
+
+      # TODO: map each live worker to its deployable directory/wrangler config.
+      # Live deployed names: jo-os-router, workshop-backend, jo-os-context, jo-os-custom-gatekeeper, jo-os-scheduler, jo-os-websearch
+      # Service bindings and multi-worker topology are partially supported in OpenOrange; validate in staging.
+      - name: Doctor / deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RIVET_CLOUD_TOKEN:-}" ]; then
+            echo "Missing RIVET_CLOUD_TOKEN secret (Rivet cluster token with Read+Deploy)." >&2
+            exit 1
+          fi
+          for w in ${{ steps.workers.outputs.list }}; do
+            echo "::group::orange $w"
+            # Resolve worker directory/config. Adjust these paths to match the actual deployable package.
+            case "$w" in
+              jo-os-router) DIR="."; CONFIG="wrangler.jsonc" ;;
+              workshop-backend) DIR="packages/workshop-backend"; CONFIG="wrangler.jsonc" ;;
+              jo-os-context) DIR="packages/gatekeeper-context"; CONFIG="wrangler.jsonc" ;;
+              jo-os-custom-gatekeeper) DIR="packages/gatekeeper-custom"; CONFIG="wrangler.jsonc" ;;
+              jo-os-scheduler) DIR="packages/gatekeeper-scheduler"; CONFIG="wrangler.jsonc" ;;
+              jo-os-websearch) DIR="packages/gatekeeper-websearch"; CONFIG="wrangler.jsonc" ;;
+            esac
+            if [ ! -d "$DIR" ]; then
+              echo "Directory not found: $DIR (adjust mapping before use)" >&2
+              echo "::endgroup::"
+              exit 1
+            fi
+            pushd "$DIR" >/dev/null
+            orange doctor || true
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "Dry run requested; skipping deploy for $w"
+            else
+              # orange link requires interactive/auth context in some flows; prefer token-based deploy.
+              # Ensure pool exists / token has required scope. First deploy may require dashboard/manual step.
+              orange deploy --cluster "$ORANGE_CLUSTER" --yes
+            fi
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Post-deploy notes
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          echo "Verify pool public URL and actor/DO behavior via Rivet MCP/CLI."
+          echo "Keep jo-os-router.nosleep.workers.dev on CF as hybrid entrypoint until Rivet cutover is validated."
